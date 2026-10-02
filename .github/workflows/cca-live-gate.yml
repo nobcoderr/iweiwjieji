@@ -11,8 +11,73 @@ on:
 permissions: {}
 
 jobs:
+  preflight:
+    name: Redacted Anthropic API preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: {}
+    outputs:
+      model: ${{ steps.check.outputs.model }}
+    steps:
+      - name: Validate credential and select an available model
+        id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const key = process.env.ANTHROPIC_API_KEY;
+          if (!key) {
+            console.log(JSON.stringify({ apiPreflight: "failed", reason: "secret_missing" }));
+            process.exit(2);
+          }
+
+          const response = await fetch("https://api.anthropic.com/v1/models?limit=100", {
+            headers: {
+              "x-api-key": key,
+              "anthropic-version": "2023-06-01",
+            },
+          });
+
+          let body = {};
+          try {
+            body = await response.json();
+          } catch {}
+
+          if (!response.ok) {
+            console.log(JSON.stringify({
+              apiPreflight: "failed",
+              httpStatus: response.status,
+              errorType: body?.error?.type ?? "unknown",
+              credentialPrinted: false,
+            }));
+            process.exit(3);
+          }
+
+          const models = Array.isArray(body.data) ? body.data : [];
+          const sonnetModels = models
+            .filter((entry) => typeof entry?.id === "string" && /sonnet/i.test(entry.id))
+            .sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")));
+          const selected = (sonnetModels[0] ?? models[0])?.id;
+          if (!selected) {
+            console.log(JSON.stringify({ apiPreflight: "failed", reason: "no_available_models" }));
+            process.exit(4);
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `model=${selected}\n`);
+          console.log(JSON.stringify({
+            apiPreflight: "passed",
+            availableModelCount: models.length,
+            selectedModel: selected,
+            credentialPrinted: false,
+          }));
+          NODE
+
   observer:
     name: Unprivileged remote observer
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions: {}
@@ -32,6 +97,7 @@ jobs:
 
   victim:
     name: Exact production action
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -48,6 +114,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: true
       - name: Run exact Claude Code Action release
+        id: claude_action
         uses: anthropics/claude-code-action@97c53473391bff1901034d4b454b5bac7ab7a029
         env:
           CLAUDE_BRANCH: ${{ inputs.target_branch }}
@@ -63,12 +130,62 @@ jobs:
             as it is. Use mcp__github_file_ops__commit_files exactly once with
             commit message "audit: preserve release notes", then stop.
           claude_args: >-
+            --model "${{ needs.preflight.outputs.model }}"
             --allowedTools "mcp__github_file_ops__commit_files"
+      - name: Emit only redacted Claude result metadata
+        if: always()
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const path = `${process.env.RUNNER_TEMP}/claude-execution-output.json`;
+
+          if (!fs.existsSync(path)) {
+            console.log(JSON.stringify({ claudeDiagnostic: "execution_file_absent" }));
+            process.exit(0);
+          }
+
+          let messages;
+          try {
+            messages = JSON.parse(fs.readFileSync(path, "utf8"));
+          } catch {
+            console.log(JSON.stringify({ claudeDiagnostic: "execution_file_unparseable" }));
+            process.exit(0);
+          }
+
+          const result = [...messages].reverse().find((entry) => entry?.type === "result") ?? {};
+          const hiddenText = JSON.stringify({ result: result.result, errors: result.errors });
+          let errorCategory = null;
+          if (result.is_error) {
+            if (/authentication|api.?key|x-api-key|\b401\b/i.test(hiddenText)) errorCategory = "authentication";
+            else if (/credit|billing|balance/i.test(hiddenText)) errorCategory = "billing";
+            else if (/rate.?limit|\b429\b/i.test(hiddenText)) errorCategory = "rate_limit";
+            else if (/model|not.?found|permission|access/i.test(hiddenText)) errorCategory = "model_access";
+            else if (/overload|\b529\b/i.test(hiddenText)) errorCategory = "overloaded";
+            else if (/network|fetch|connect|timeout/i.test(hiddenText)) errorCategory = "transport";
+            else errorCategory = "unclassified";
+          }
+
+          console.log(JSON.stringify({
+            claudeDiagnostic: "redacted",
+            subtype: result.subtype ?? null,
+            isError: result.is_error ?? null,
+            durationMs: result.duration_ms ?? null,
+            numTurns: result.num_turns ?? null,
+            totalCostUsd: result.total_cost_usd ?? null,
+            permissionDenialsCount: Array.isArray(result.permission_denials)
+              ? result.permission_denials.length
+              : null,
+            modelUsageKeys: result.modelUsage ? Object.keys(result.modelUsage) : [],
+            errorCategory,
+            rawResultPrinted: false,
+          }));
+          NODE
 
   cleanup:
     name: Cleanup disposable refs
     if: always()
-    needs: [observer, victim]
+    needs: [preflight, observer, victim]
     runs-on: ubuntu-latest
     permissions:
       contents: write

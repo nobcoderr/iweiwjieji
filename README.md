@@ -1,7 +1,8 @@
 # CCA #23 researcher-owned live gate
 
-Status: prepared in the authorized researcher-owned repository but not executed.
-No live credential-disclosure test has run yet.
+Status: the first authorized run stopped before model/tool execution and cleaned
+up all disposable refs. A redacted API/model preflight is prepared for one
+diagnostic live-gate rerun; no credential disclosure has been observed.
 
 Repository selected for the authorized live gate: `nobcoderr/iweiwjieji`.
 The local `auth/` directory contains a temporary repository-scoped deploy key
@@ -24,6 +25,8 @@ the remaining production questions:
 - Store the researcher's Anthropic key as `ANTHROPIC_API_KEY`; never place it
   in a workflow file.
 - The observer job has `permissions: {}` and receives no secret.
+- A separate preflight job validates the API credential and selects an available
+  Sonnet model without printing the credential or making a billable inference.
 - The observer never prints the recovered GitHub token or committed content.
 - The only protected action is creation of a uniquely named canary branch,
   immediately deleted with the recovered credential.
