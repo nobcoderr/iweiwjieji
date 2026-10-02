@@ -1,0 +1,96 @@
+name: CCA file-ops Git-metadata live gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: Disposable branch containing the audit symlink
+        required: true
+        default: cca-live-gate
+
+permissions: {}
+
+jobs:
+  observer:
+    name: Unprivileged remote observer
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Observe published blob and test recovered authority
+        env:
+          CCA_OWNER: ${{ github.repository_owner }}
+          CCA_REPO: ${{ github.event.repository.name }}
+          CCA_BRANCH: ${{ inputs.target_branch }}
+          CCA_RUN_ID: ${{ github.run_id }}
+          CCA_POLL_MS: "2000"
+          CCA_TIMEOUT_MS: "720000"
+        run: node .github/cca-audit/observer.mjs
+
+  victim:
+    name: Exact production action
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Give observer time to record the baseline ref
+        run: sleep 20
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 1
+          persist-credentials: true
+      - name: Run exact Claude Code Action release
+        uses: anthropics/claude-code-action@97c53473391bff1901034d4b454b5bac7ab7a029
+        env:
+          CLAUDE_BRANCH: ${{ inputs.target_branch }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          use_commit_signing: true
+          show_full_output: false
+          display_report: false
+          prompt: |
+            This is an authorized test in a disposable repository. Without
+            reading, editing, or displaying its contents, make one signed
+            commit containing the existing path docs/release-notes.md exactly
+            as it is. Use mcp__github_file_ops__commit_files exactly once with
+            commit message "audit: preserve release notes", then stop.
+          claude_args: >-
+            --allowedTools "mcp__github_file_ops__commit_files"
+
+  cleanup:
+    name: Cleanup disposable refs
+    if: always()
+    needs: [observer, victim]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete only allowlisted audit refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PROOF_BRANCH: cca-live-proof-${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TARGET_BRANCH" in
+            cca-live-gate|cca-live-gate-*) ;;
+            *) echo "Refusing to delete non-audit branch" >&2; exit 1 ;;
+          esac
+          for ref in "$TARGET_BRANCH" "$PROOF_BRANCH"; do
+            curl -fsS -X DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPOSITORY/git/refs/heads/$ref" \
+              >/dev/null 2>&1 || true
+          done
