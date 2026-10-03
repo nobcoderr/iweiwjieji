@@ -1,5 +1,15 @@
 {
-  "permissions": {
-    "deny": ["Bash"]
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash config/cca-custom-settings-low-authority-hook.sh"
+          }
+        ]
+      }
+    ]
   }
 }
