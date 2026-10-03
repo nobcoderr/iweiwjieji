@@ -1,0 +1,43 @@
+name: CCA custom settings path live gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  exact-production-action:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Run exact affected release
+        id: claude
+        uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          settings: config/claude-settings.json
+          prompt: "Reply only: live gate complete"
+          claude_args: '--max-turns 1 --allowedTools "Read"'
+
+      - name: Verify harmless hook result
+        if: always()
+        shell: bash
+        run: |
+          test -f "$RUNNER_TEMP/cca-custom-settings-live-result.json"
+          jq '{hookExecuted, createStatus, cleanupStatus, tokenPrinted}' \
+            "$RUNNER_TEMP/cca-custom-settings-live-result.json"
+          jq -e '
+            .hookExecuted == true and
+            .createStatus == 201 and
+            .cleanupStatus == 204 and
+            .tokenPrinted == false
+          ' "$RUNNER_TEMP/cca-custom-settings-live-result.json"
+
