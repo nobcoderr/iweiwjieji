@@ -1,22 +1,78 @@
-name: CCA custom settings path live gate
+name: CCA custom settings maintainer-trigger gate
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: write
   pull-requests: write
+  issues: write
   id-token: write
 
 jobs:
   exact-production-action:
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout trusted base branch
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Record low-authority baseline
+        shell: bash
+        env:
+          BASELINE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          pr_number="${{ github.event.issue.number }}"
+          pr_json="$RUNNER_TEMP/cca-pr.json"
+          curl -fsS \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${BASELINE_GITHUB_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
+            -o "$pr_json"
+
+          pr_author="$(jq -r '.user.login' "$pr_json")"
+          pr_head_repo="$(jq -r '.head.repo.full_name' "$pr_json")"
+          pr_head_sha="$(jq -r '.head.sha' "$pr_json")"
+
+          permission_response="$RUNNER_TEMP/cca-author-permission.json"
+          permission_status="$(curl -sS -o "$permission_response" -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${BASELINE_GITHUB_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/collaborators/${pr_author}/permission")"
+
+          if [ "$permission_status" = 200 ]; then
+            pr_author_permission="$(jq -r '.permission' "$permission_response")"
+          elif [ "$permission_status" = 404 ]; then
+            pr_author_permission="none"
+          else
+            echo "Unexpected collaborator-permission status: $permission_status" >&2
+            exit 1
+          fi
+
+          jq -n \
+            --arg triggerActor "$GITHUB_ACTOR" \
+            --arg prAuthor "$pr_author" \
+            --arg prAuthorPermission "$pr_author_permission" \
+            --arg prHeadRepo "$pr_head_repo" \
+            --arg prHeadSha "$pr_head_sha" \
+            '{triggerActor:$triggerActor,prAuthor:$prAuthor,prAuthorPermission:$prAuthorPermission,prHeadRepo:$prHeadRepo,prHeadSha:$prHeadSha}' \
+            > "$RUNNER_TEMP/cca-low-authority-baseline.json"
+
+          test "$GITHUB_ACTOR" != "$pr_author"
+          case "$pr_author_permission" in
+            none|read|triage) ;;
+            *) echo "PR author unexpectedly has write authority: $pr_author_permission" >&2; exit 1 ;;
+          esac
 
       - name: Run exact affected release
         id: claude
@@ -24,20 +80,40 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           settings: config/claude-settings.json
-          prompt: "Reply only: live gate complete"
           claude_args: '--max-turns 1 --allowedTools "Read"'
 
-      - name: Verify harmless hook result
+      - name: Verify low-authority security oracle
         if: always()
         shell: bash
+        env:
+          BASELINE_GITHUB_TOKEN: ${{ github.token }}
         run: |
-          test -f "$RUNNER_TEMP/cca-custom-settings-live-result.json"
-          jq '{hookExecuted, createStatus, cleanupStatus, tokenPrinted}' \
-            "$RUNNER_TEMP/cca-custom-settings-live-result.json"
+          set -euo pipefail
+          baseline="$RUNNER_TEMP/cca-low-authority-baseline.json"
+          result="$RUNNER_TEMP/cca-custom-settings-live-result.json"
+
+          test -f "$baseline"
+          test -f "$result"
+
+          jq -s '.[0] + .[1]' "$baseline" "$result" \
+            > "$RUNNER_TEMP/cca-low-authority-live-result.json"
+
+          jq '{triggerActor,prAuthor,prAuthorPermission,prHeadRepo,hookExecuted,createStatus,cleanupStatus,tokenPrinted}' \
+            "$RUNNER_TEMP/cca-low-authority-live-result.json"
+
           jq -e '
+            .triggerActor != .prAuthor and
+            (.prAuthorPermission == "none" or .prAuthorPermission == "read" or .prAuthorPermission == "triage") and
             .hookExecuted == true and
             .createStatus == 201 and
             .cleanupStatus == 204 and
             .tokenPrinted == false
-          ' "$RUNNER_TEMP/cca-custom-settings-live-result.json"
+          ' "$RUNNER_TEMP/cca-low-authority-live-result.json"
 
+          canary="cca-settings-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          remaining_status="$(curl -sS -o "$RUNNER_TEMP/cca-canary-readback.json" -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${BASELINE_GITHUB_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/heads/${canary}")"
+          test "$remaining_status" = 404
